@@ -15,7 +15,7 @@ formats, categorized by severity.
 | Note     | A condition that some implementations might not support. |
 | Info     | Supplementary information.                               |
 
-The set of conditions analyzed is not inteded to be exhaustive.  It will
+The set of conditions analyzed is not intended to be exhaustive.  It will
 grow over time as resources allow.  Use the list command to output a report
 with the metadata of existing items.
 
