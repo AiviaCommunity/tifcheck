@@ -33,7 +33,7 @@ formats, categorized by severity.
   Note   A condition that some implementations might not support.
   Info   Supplementary information.
 
-The set of conditions analyzed is not inteded to be exhaustive.  It will
+The set of conditions analyzed is not intended to be exhaustive.  It will
 grow over time as resources allow.  Use the list command to output a report
 with the metadata of existing items.
 
@@ -75,7 +75,7 @@ from time import time
 ############################################################################
 # Classes.
 
-class Preamble:
+class TifPreamble:
     struct32 = struct.Struct('=2s2s4s')  # The '=' is for no padding.
     struct64 = struct.Struct('=2s2s4s8s')
 
@@ -87,13 +87,13 @@ class Preamble:
     is64: bool
     link: int
 
-    struct: struct.Struct    
+    pre_struct: struct.Struct
     count_struct: struct.Struct
-    tag_struct: struct.Struct
+    entry_struct: struct.Struct
     link_struct: struct.Struct
 
     def __init__(self, src):
-        (self.sig, self.ver, link32, link64) = Preamble.struct64.unpack(src)
+        self.sig, self.ver, link32, link64 = TifPreamble.struct64.unpack(src)
 
         self.order = '<' if self.sig == b'II' else \
                      '>' if self.sig == b'MM' else ''
@@ -111,9 +111,9 @@ class Preamble:
         self.link = struct.unpack(self.order + 'Q', link64)[0] if self.is64 else \
                     struct.unpack(self.order + 'I', link32)[0]
 
-        self.struct = Preamble.struct64 if self.is64 else Preamble.struct32
+        self.pre_struct = TifPreamble.struct64 if self.is64 else TifPreamble.struct32
         self.count_struct = struct.Struct(self.order + ('Q' if self.is64 else 'H'))
-        self.tag_struct = struct.Struct(self.order + ('HHQQ' if self.is64 else 'HHII'))
+        self.entry_struct = struct.Struct(self.order + ('HHQQ' if self.is64 else 'HHII'))
         self.link_struct = struct.Struct(self.order + ('Q' if self.is64 else 'I'))
 
     def is_wellformed(self):
@@ -123,11 +123,11 @@ class Preamble:
         return self.offset_ifd_link(tag_count) + self.link_struct.size
 
     def offset_ifd_link(self, tag_count):
-        return self.count_struct.size + tag_count * self.tag_struct.size
+        return self.count_struct.size + tag_count * self.entry_struct.size
 
 @dataclasses.dataclass
-class Tag:
-    code: int
+class TifEntry:
+    tag: int
     dtype: int
     count: int
     value: int
@@ -139,7 +139,7 @@ class ItemCategory(int, enum.Enum):
     warn = 3
     error = 4
     fail = 5
-    
+
 class ItemStatus(int, enum.Enum):
     none = 0
     deprecated = 1
@@ -152,7 +152,7 @@ class ItemStatus(int, enum.Enum):
 @dataclasses.dataclass
 class Item:
     # The first five fields come from a static definition.  The value field is
-    # optional and may be different for every checked occurance.
+    # optional and may be different for every checked occurrence.
     code: int
     category: ItemCategory
     status: ItemStatus
@@ -167,27 +167,48 @@ class Item:
         return {k: v.name if isinstance(v, enum.Enum) else v
                 for k, v in self.__dict__.items() if k != 'value'}
 
+class RepairList:
+    command: str
+    enabled: dict[int,str]
+    repaired: list[Item]
+
+    def __init__(self, command=''):
+        self.command = command
+        if command == '-repair':
+            self.enabled = {i.code: '' for i in list_all() if i.status == ItemStatus.repairable}
+        else:
+            self.enabled = {}
+            parts = command[len('-repair-'):].split('-')
+            for i in reversed(range(len(parts) - 1)):
+                if not str.isdecimal(parts[i + 1][0]) or (not str.isdecimal(parts[i][-1]) and parts[i][-1] != ')'):
+                    parts[i] += parts[i + 1]  # Allow negative numbers inside parameters.
+            for p in parts:
+                if p:
+                    paren = p.find('(')
+                    if paren == -1:
+                        self.enabled[int(p)] = ''
+                    else:
+                        self.enabled[int(p[:paren])] = p[paren + 1:-1]
+        self.repaired = []
+
 # Item definitions are maintained here in the form of method decls, which
 # synthesize items from parameters combined with reflection on the method
 # name.  This is for prototyping ergonomics, and will change eventually.
-class ItemList:
-    items: list[Item]
-    file_size_digits: int  # For message formatting.
+class TifCheck:
+    items: list[Item] = []
+    repairs: RepairList
+    fsize: int
+    file_size_digits: int
+    tp: TifPreamble
+    ifd_count: int
 
-    def __init__(self, items=None):
-        self.items = items or []
-
-    def _a(self, val, code, status, comment=''):
-        parts = inspect.stack()[1].function.split('_')
-        name = ' '.join(parts[1:])
-        if val != None:
-            i = Item(code, ItemCategory[parts[0]], status, name, comment, str(val))
-            return self.items.append(i) or self
-        else:
-            for i in self.items:
-                if i.name == name:
-                    return i
-            return None
+    def __init__(self, path, repairs):
+        if path:
+            self.repairs = repairs
+            self._check_file(path)
+            with open(path, 'r+b' if repairs.enabled else 'rb') as f:
+                if self._check_preamble(f) and self._check_primary_chain(f):
+                    self._check_tags(f)
 
     #####################
     # Begin definitions #
@@ -227,209 +248,151 @@ class ItemList:
     #  End definitions  #
     #####################
 
-class RepairList:
-    command: str
-    enabled: dict[int,str]
-    repaired: list[Item]
-
-    def __init__(self, command=''):
-        self.command = command
-        if command == '-repair':
-            self.enabled = {i.code: '' for i in list_all() if i.status == ItemStatus.repairable}
+    def _a(self, val, code, status, comment=''):
+        parts = inspect.stack()[1].function.split('_')
+        name = ' '.join(parts[1:])
+        if val != None:
+            i = Item(code, ItemCategory[parts[0]], status, name, comment, str(val))
+            return self.items.append(i) or i
         else:
-            self.enabled = {}
-            parts = command[len('-repair-'):].split('-')
-            for i in reversed(range(len(parts) - 1)):
-                if not str.isdecimal(parts[i + 1][0]) or (not str.isdecimal(parts[i][-1]) and parts[i][-1] != ')'):
-                    parts[i] += parts[i + 1]  # Allow negative numbers inside parameters.
-            for p in parts:
-                if p:
-                    paren = p.find('(')
-                    if paren == -1:
-                        self.enabled[int(p)] = ''
-                    else:
-                        self.enabled[int(p[:paren])] = p[paren + 1:-1]
-        self.repaired = []
+            for i in self.items:
+                if i.name == name:
+                    return i
+            return None
 
-    def try_fix_tag_out_of_order(self, itemlist, f, p, pos, ifd_index, tag_count, tags):
-        msg = f'IFD #{ifd_index} at {str(pos).zfill(itemlist.file_size_digits)}: Tags are out of order.'
-        item = itemlist.error_tag_out_of_order(msg).items[-1]
+    def zfill(self, n):
+        return str(n).zfill(self.file_size_digits)
 
-        if item.code not in self.enabled:
-            return tags
-
-        if tag_count > TAG_CUTOFF:
-            print(f'Repairs are not supported on IFDs with tag count greater than {TAG_CUTOFF}.')
-            return tags
-
-        reorder = sorted(enumerate(tags), key=lambda _, tag: tag.code)
-        _rewrite_tags(f, p, pos, [i for i, _ in reorder])
-
-        self.repaired.append(itemlist.items.pop())
-        return [tag for _, tag in reorder]
-
-    def try_fix_tag_conflict(self, itemlist, f, p, pos, ifd_index, tag_count, tags, code, count):
-        msg = f'IFD #{ifd_index} at {str(pos).zfill(itemlist.file_size_digits)}: Tag code {code} has {count} copies in conflict.'
-        item = itemlist.error_tag_conflict(msg).items[-1]
-
-        if item.code not in self.enabled:
-            return tags, tag_count
-
-        if tag_count > TAG_CUTOFF:
-            print(f'Repairs are not supported on IFDs with tag count greater than {TAG_CUTOFF}.')
-            return tags, tag_count
-
-        args = self.enabled[item.code] or '0'
-        if len(args) == 1 and args[0].isdecimal() and int(args[0]) < count:
-            selected = int(args[0])
-        else:
-            print(f'Ignored invalid parameter for tag conflict repair: \'{args}\'')
-            selected = 0
-
-        # Send the non-selected copies to the back without otherwise reordering.
-        keep, reject = [], []
-        for i in enumerate(tags):
-            (keep if i[1].code != code else reject).append(i)
-        assert len(reject) == count
-        (keep.append(reject.pop(selected)) or keep).sort()
-        _rewrite_tags(f, p, pos, [i for i, _ in keep + reject])
-
-        # Update the IFD's count and link fields.
-        link = _read_struct(f, p.link_struct, pos + p.offset_ifd_link(tag_count))
-        _write_struct(f, p.count_struct, pos, len(keep))
-        _write_struct(f, p.link_struct, pos + p.offset_ifd_link(len(keep)), link)
-
-        self.repaired.append(itemlist.items.pop())
-        return [tag for _, tag in keep], len(keep)
-
-
-############################################################################
-# Functions.
-
-def list_all():
-    r = ItemList()
-    for a in dir(r):
-        if a.split('_')[0] in list(ItemCategory.__members__):
-            getattr(r, a)('')
-    return sorted(r.items, key=lambda i: i.code)
-
-def check(path, repairs):
-    r = ItemList()
-    with open(path, 'r+b' if repairs.enabled else 'rb') as f:
-
-        # Collect file info.
+    def _check_file(self, path):
         if not path.endswith('.tif'):
-            r.note_nonstandard_ext(os.path.splitext(path)[-1].lstrip('.'))
-
+            self.note_nonstandard_ext(os.path.splitext(path)[-1].lstrip('.'))
         finfo = os.stat(path)
-        fsize = finfo.st_size
-        r.file_size_digits = digits = math.ceil(math.log(fsize, 10))
+        self.fsize = finfo.st_size
+        self.file_size_digits = math.ceil(math.log(self.fsize, 10))
         try:
-            r.info_file_path_resolved(os.path.realpath(path))
-            r.info_file_size(fsize)
-            r.info_file_modified(datetime.fromtimestamp(finfo.st_mtime, UTC).strftime(ISO_8601_UTC))
-            r.info_file_created(datetime.fromtimestamp(_creation_time(finfo), UTC).strftime(ISO_8601_UTC))
+            self.info_file_path_resolved(os.path.realpath(path))
+            self.info_file_size(self.fsize)
+            self.info_file_modified(datetime.fromtimestamp(finfo.st_mtime, UTC).strftime(ISO_8601_UTC))
+            self.info_file_created(datetime.fromtimestamp(_creation_time(finfo), UTC).strftime(ISO_8601_UTC))
         except:
             pass  # OS problems.
 
-        # Check the preamble.
-        b = f.read(Preamble.struct64.size)
-        if len(b) < Preamble.struct64.size:
+    def _check_preamble(self, f):
+        b = f.read(TifPreamble.struct64.size)
+        if len(b) < TifPreamble.struct64.size:
             # For simplicity we also trap here for file size between 32 and 64-bit preamble size, which is not recoverable.
-            return r.fail_signature_missing(f'File size of {len(b)} is too small.')
+            self.fail_signature_missing(f'File size of {len(b)} is too small.')
+            return False
 
-        p = Preamble(b)
-        if not p.order:
-            return r.fail_signature_unknown('0x' + p.sig.hex())
+        self.tp = TifPreamble(b)
+        if not self.tp.order:
+            self.fail_signature_unknown('0x' + self.tp.sig.hex())
+            return False
 
-        if not p.bits:
-            return r.fail_tiff_version_unknown('0x' + p.ver.hex())
+        if not self.tp.bits:
+            self.fail_tiff_version_unknown('0x' + self.tp.ver.hex())
+            return False
 
-        r.info_tiff_bits(p.bits)
-        r.info_tiff_order('LE' if p.order == '<' else 'BE')
-        r.info_ifd_first_offset(str(p.link).zfill(digits))
+        self.info_tiff_bits(self.tp.bits)
+        self.info_tiff_order('LE' if self.tp.order == '<' else 'BE')
+        self.info_ifd_first_offset(self.zfill(self.tp.link))
+        return True
 
-        # Check all links in the primary IFD chain.
-        link = min_start = max_stop = p.link
-        ifd_count = unaligned = ifd_size_total = validated = 0
+    def _check_primary_chain(self, f):
+        link = min_start = max_stop = self.tp.link
+        self.ifd_count = unaligned = ifd_size_total = validated = 0
         ifd_range = lambda: max_stop - min_start
 
         while link:
             # Check the link.
-            if link < p.struct.size:
-                if link == p.link:
-                    return r.fail_ifd_start_invalid(link)
-                r.error_ifd_link_invalid(link)
+            if link < self.tp.pre_struct.size:
+                if link == self.tp.link:
+                    self.fail_ifd_start_invalid(link)
+                    return False
+                self.error_ifd_link_invalid(link)
                 break
 
-            if link > fsize - p.sizeof_ifd(0):
-                if link == p.link:
-                    return r.fail_ifd_start_out_of_bounds(link)
-                r.error_ifd_link_out_of_bounds(link)
+            if link > self.fsize - self.tp.sizeof_ifd(0):
+                if link == self.tp.link:
+                    self.fail_ifd_start_out_of_bounds(link)
+                    return False
+                self.error_ifd_link_out_of_bounds(link)
                 break
 
             if link & 1:
                 unaligned += 1
 
-            # Check tag count at the link.
-            tag_count = _read_struct(f, p.count_struct, link)
-            ifd_size = p.sizeof_ifd(tag_count)
+            # Check entry count at the link.
+            entry_count = _read_struct(f, self.tp.count_struct, link)
+            ifd_size = self.tp.sizeof_ifd(entry_count)
 
-            if ifd_size > fsize - link:
-                return r.fail_ifd_size_out_of_bounds(
-                    f'IFD #{ifd_count} at {str(link).zfill(digits)}: Size of {ifd_size} with {tag_count} tags exceeds file size of {fsize}.')
+            if ifd_size > self.fsize - link:
+                self.fail_ifd_size_out_of_bounds(
+                    f'IFD #{self.ifd_count} at {self.zfill(link)}: Size of {ifd_size} with {entry_count} tags exceeds file size of {self.fsize}.')
+                return False
 
-            if tag_count > TAG_CUTOFF:
-                r.warn_ifd_oversize(
-                    f'IFD #{ifd_count} at {str(link).zfill(digits)}: Ignoring {tag_count - TAG_CUTOFF} of {tag_count} tags.')
+            if entry_count > TAG_CUTOFF:
+                self.warn_ifd_oversize(
+                    f'IFD #{self.ifd_count} at {self.zfill(link)}: Ignoring {entry_count - TAG_CUTOFF} of {entry_count} tags.')
 
-            if tag_count < 1:
-                r.warn_ifd_empty(link)
+            if entry_count < 1:
+                self.warn_ifd_undersize(link)
 
             # Cycle detection.  Low precision, constant memory.
             min_start = min(min_start, link)
             max_stop = max(max_stop, link + ifd_size)
             ifd_size_total += ifd_size
             if ifd_size_total > ifd_range():
-                r.error_ifd_circular_link('')  # TODO: Iterate again to find the first circular link.
+                self.error_ifd_circular_link('')  # TODO: Iterate again to find the first circular link.
                 break
 
             # Accept IFD and read next link.
-            ifd_count += 1
+            self.ifd_count += 1
             validated = link
-            link = _read_struct(f, p.link_struct, link + p.offset_ifd_link(tag_count))
+            link = _read_struct(f, self.tp.link_struct, link + self.tp.offset_ifd_link(entry_count))
 
-        r.info_ifd_count(ifd_count)
+        self.info_ifd_count(self.ifd_count)
         if validated:
-            r.info_ifd_last_offset(str(validated).zfill(digits))
+            self.info_ifd_last_offset(self.zfill(validated))
 
         if ifd_size_total <= ifd_range():
-            r.info_ifd_fragmentation(f'{1 - (ifd_size_total / ifd_range()):.2f}')
+            self.info_ifd_fragmentation(f'{1 - (ifd_size_total / ifd_range()):.2f}')
 
         if unaligned:
-            r.info_unaligned_offset_count(unaligned)
+            self.info_unaligned_offset_count(unaligned)
+        return True
 
-        # Check tags.
-        pos = p.link
-        for ifd_index in range(ifd_count):
-            tag_count = _read_struct(f, p.count_struct, pos)
-            b = f.read(min(tag_count, TAG_CUTOFF) * p.tag_struct.size)
-            tags = [Tag(*t) for t in p.tag_struct.iter_unpack(b)]
+    def _check_tags(self, f):
+        pos = self.tp.link
+        for ifd_index in range(self.ifd_count):
+            entry_count = _read_struct(f, self.tp.count_struct, pos)  # Count is pre-cutoff, for editing down below.
+            b = f.read(min(entry_count, TAG_CUTOFF) * self.tp.entry_struct.size)
+            entries = [TifEntry(*t) for t in self.tp.entry_struct.iter_unpack(b)]
 
-            prev_count = r.items.count
-            original = [i.code for i in tags]
+            original = [i.tag for i in entries]
             ordered = sorted(original)
             if original != ordered:
-                tags = repairs.try_fix_tag_out_of_order(r, f, p, pos, ifd_index, tag_count, tags)
+                entries = try_fix_tag_out_of_order(self, f, pos, ifd_index, entry_count, entries)
 
             conflicts = {ordered[i] for i in range(len(ordered) - 1) if ordered[i] == ordered[i + 1]}
-            for code in conflicts:
-                count = sum(1 for i in tags if i.code == code)
-                tags, tag_count = repairs.try_fix_tag_conflict(r, f, p, pos, ifd_index, tag_count, tags, code, count)
+            for tag in conflicts:
+                count = sum(1 for i in entries if i.tag == tag)
+                entries, entry_count = try_fix_tag_conflict(self, f, pos, ifd_index, entry_count, entries, tag, count)
 
-            pos = _read_struct(f, p.link_struct, pos + p.offset_ifd_link(tag_count))
-        return r
+            pos = _read_struct(f, self.tp.link_struct, pos + self.tp.offset_ifd_link(entry_count))
+        return True
 
+############################################################################
+# Functions.
+
+def list_all():
+    # Call each item method with a dummy value to add it to the result.
+    check = TifCheck(None, None)
+    for a in dir(check):
+        if a.split('_')[0] in list(ItemCategory.__members__):
+            getattr(check, a)('')
+    # Return all items added, sorted by number.
+    return sorted(check.items, key=lambda i: i.code)
 
 def _friendly_file_size(n):
     """
@@ -467,13 +430,64 @@ def _write_struct(f, st, pos, *vals):
     b = st.pack(*vals)
     _write_pos(f, pos, b)
 
-def _rewrite_tags(f, p, pos, src_indexes):
-    base_pos = pos + p.count_struct.size
-    step = p.tag_struct.size
+def _rewrite_entries(f, tp, pos, src_indexes):
+    base_pos = pos + tp.count_struct.size
+    step = tp.entry_struct.size
     buffer = bytearray(len(src_indexes) * step)
     for i in range(len(src_indexes)):
         buffer[i * step:i * step + step] = _read_pos(f, base_pos + src_indexes[i] * step, step)
     _write_pos(f, base_pos, buffer)
+
+def try_fix_tag_out_of_order(check, f, pos, ifd_index, entry_count, entries):
+    msg = f'IFD #{ifd_index} at {check.zfill(pos)}: Tags are out of order.'
+    item = check.error_tag_out_of_order(msg)
+
+    if item.code not in check.repairs.enabled:
+        return entries
+
+    if entry_count > TAG_CUTOFF:
+        print(f'Repairs are not supported on IFDs with tag count greater than {TAG_CUTOFF}.')
+        return entries
+
+    reorder = sorted(enumerate(entries), key=lambda _, entry: entry.tag)
+    _rewrite_entries(f, check.tp, pos, [i for i, _ in reorder])
+
+    check.repairs.repaired.append(check.items.pop())
+    return [tag for _, tag in reorder]
+
+def try_fix_tag_conflict(check, f, pos, ifd_index, entry_count, entries, tag, count):
+    msg = f'IFD #{ifd_index} at {check.zfill(pos)}: Tag {tag} has {count} copies in conflict.'
+    item = check.error_tag_conflict(msg)
+
+    if item.code not in check.repairs.enabled:
+        return entries, entry_count
+
+    if entry_count > TAG_CUTOFF:
+        print(f'Repairs are not supported on IFDs with tag count greater than {TAG_CUTOFF}.')
+        return entries, entry_count
+
+    args = check.repairs.enabled[item.code] or '0'
+    if len(args) == 1 and args[0].isdecimal() and int(args[0]) < count:
+        selected = int(args[0])
+    else:
+        print(f'Ignored invalid parameter for tag conflict repair: \'{args}\'')
+        selected = 0
+
+    # Send the non-selected copies to the back without otherwise reordering.
+    keep, reject = [], []
+    for i in enumerate(entries):
+        (keep if i[1].tag != tag else reject).append(i)
+    assert len(reject) == count
+    (keep.append(reject.pop(selected)) or keep).sort()
+    _rewrite_entries(f, check.tp, pos, [i for i, _ in keep + reject])
+
+    # Update the IFD's count and link fields.
+    link = _read_struct(f, check.tp.link_struct, pos + check.tp.offset_ifd_link(entry_count))
+    _write_struct(f, check.tp.count_struct, pos, len(keep))
+    _write_struct(f, check.tp.link_struct, pos + check.tp.offset_ifd_link(len(keep)), link)
+
+    check.repairs.repaired.append(check.items.pop())
+    return [entry for _, entry in keep], len(keep)
 
 
 ############################################################################
@@ -481,8 +495,8 @@ def _rewrite_tags(f, p, pos, src_indexes):
 
 def main(argv=None):
     def usage(path=None):
-        print("Usage:   python tifcheck [-list] [-repair[SPEC]] [PATH]")
-        print("Example: python tifcheck -repair-203-204(0) \"example.tif\"")
+        print("Usage:   python tifcheck.py [-list] [-repair[SPEC]] [PATH]")
+        print("Example: python tifcheck.py -repair-203-204(0) \"example.tif\"")
         if path:
             print('Path does not exist: ' + path)
         return 1
@@ -519,7 +533,7 @@ def main(argv=None):
 
         # Analyze and repair.
         t = time()
-        result = check(path, repairs)
+        result = TifCheck(path, repairs)
         t = time() - t
 
         # Output results.
@@ -527,7 +541,7 @@ def main(argv=None):
         bits = result.info_tiff_bits()
         order = result.info_tiff_order()
         
-        (_, info, note, warn, error, fail) = \
+        _, info, note, warn, error, fail = \
             [[i.valdict() for i in result.items if i.category == cat] for cat in ItemCategory]
 
         temp = {
