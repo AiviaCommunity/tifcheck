@@ -63,7 +63,6 @@ import inspect
 import json
 import math
 import os
-import platform
 import struct
 import sys
 import tkinter
@@ -140,6 +139,12 @@ class ItemCategory(int, enum.Enum):
     error = 4
     fail = 5
 
+class ItemAuthority(int, enum.Enum):
+    none = 0
+    vendor = 1
+    tiff6 = 2  # For now also use this for all Adobe tech notes, plus BigTIFF.
+    ome = 3
+
 class ItemStatus(int, enum.Enum):
     none = 0
     deprecated = 1
@@ -151,21 +156,26 @@ class ItemStatus(int, enum.Enum):
 
 @dataclasses.dataclass
 class Item:
-    # The first five fields come from a static definition.  The value field is
+    # All fields but one come from a static definition.  The values field is
     # optional and may be different for every checked occurrence.
     code: int
     category: ItemCategory
     status: ItemStatus
     name: str
+    authority: ItemAuthority
+    template: str
     comment: str
-    value: str
+    values: list[str]
 
+    def display(self):
+        return self.template.format(*self.values)
+    
     def valdict(self):
-        return {'code': self.code, 'name': self.name, 'value': self.value}
+        return {'code': self.code, 'name': self.name, 'template': self.template, 'values': self.values}
 
     def metadict(self):
         return {k: v.name if isinstance(v, enum.Enum) else v
-                for k, v in self.__dict__.items() if k != 'value'}
+                for k, v in self.__dict__.items() if k != 'values'}
 
 class RepairList:
     command: str
@@ -214,45 +224,45 @@ class TifCheck:
     # Begin definitions #
     #####################
 
-    def fail_signature_missing(self, v=None):  return self._a(v, 101, ItemStatus.standard)
-    def fail_signature_unknown(self, v=None):  return self._a(v, 102, ItemStatus.standard)
-    def fail_tiff_version_unknown(self, v=None):      return self._a(v, 103, ItemStatus.standard)
-    def fail_ifd_start_invalid(self, v=None):  return self._a(v, 104, ItemStatus.standard, "Before the end of the preamble.")
-    def fail_ifd_start_out_of_bounds(self, v=None):   return self._a(v, 105, ItemStatus.standard, "Beyond the end of the file.")
-    def fail_ifd_size_out_of_bounds(self, v=None):    return self._a(v, 106, ItemStatus.standard)
+    def fail_signature_missing(self, v=None):  return self._a(v, 101, ItemStatus.standard, ItemAuthority.tiff6, 'File size of {} is too small.')
+    def fail_signature_unknown(self, v=None):  return self._a(v, 102, ItemStatus.standard, ItemAuthority.tiff6)
+    def fail_tiff_version_unknown(self, v=None):      return self._a(v, 103, ItemStatus.standard, ItemAuthority.tiff6)
+    def fail_ifd_start_invalid(self, v=None):  return self._a(v, 104, ItemStatus.standard, ItemAuthority.tiff6, comment="Before the end of the preamble.")
+    def fail_ifd_start_out_of_bounds(self, v=None):   return self._a(v, 105, ItemStatus.standard, ItemAuthority.tiff6, comment="Beyond the end of the file.")
+    def fail_ifd_size_out_of_bounds(self, v=None):    return self._a(v, 106, ItemStatus.standard, ItemAuthority.tiff6)
 
-    def error_ifd_link_invalid(self, v=None):  return self._a(v, 200, ItemStatus.standard, "An invalid position before the end of the file.")
-    def error_ifd_link_out_of_bounds(self, v=None):   return self._a(v, 201, ItemStatus.standard, "Beyond the end of the file.")
-    def error_ifd_circular_link(self, v=None): return self._a(v, 202, ItemStatus.standard)
-    def error_tag_out_of_order(self, v=None):  return self._a(v, 203, ItemStatus.repairable)
-    def error_tag_conflict(self, v=None):      return self._a(v, 204, ItemStatus.repairable)
+    def error_ifd_link_invalid(self, v=None):  return self._a(v, 200, ItemStatus.standard, ItemAuthority.tiff6, comment="An invalid position before the end of the file.")
+    def error_ifd_link_out_of_bounds(self, v=None):   return self._a(v, 201, ItemStatus.standard, ItemAuthority.tiff6, comment="Beyond the end of the file.")
+    def error_ifd_circular_link(self, v=None): return self._a(v, 202, ItemStatus.standard, ItemAuthority.tiff6)
+    def error_tag_out_of_order(self, v=None):  return self._a(v, 203, ItemStatus.repairable, ItemAuthority.tiff6, comment="No repair parameters.")
+    def error_tag_conflict(self, v=None):      return self._a(v, 204, ItemStatus.repairable, ItemAuthority.tiff6, 'IFD #{} at {}: Tag {} has {} copies in conflict.', comment="Repair parameter: The zero-based index of which copy to keep.  The default is 0.  Example: '204(0)' keeps the first and deletes all others.")
 
-    def warn_ifd_empty(self, v=None):          return self._a(v, 300, ItemStatus.standard)
+    def warn_ifd_empty(self, v=None):          return self._a(v, 300, ItemStatus.standard, ItemAuthority.tiff6)
     def warn_ifd_oversize(self, v=None):       return self._a(v, 301, ItemStatus.standard)
 
-    def note_nonstandard_ext(self, v=None):    return self._a(v, 400, ItemStatus.standard, "Expected 'tif', all lowercase, no dot.  One 'f' for 'file', not two for 'file format'.")
+    def note_nonstandard_ext(self, v=None):    return self._a(v, 400, ItemStatus.standard, comment="Expected 'tif', all lowercase, no dot.  One 'f' for 'file', not two for 'file format'.")
 
     def info_file_path_resolved(self, v=None): return self._a(v, 1000, ItemStatus.standard)
-    def info_file_size(self, v=None):          return self._a(v, 1001, ItemStatus.standard, "Bytes.")
-    def info_file_modified(self, v=None):      return self._a(v, 1002, ItemStatus.standard, "ISO 8601 file modified time according to platform.")
-    def info_file_created(self, v=None):       return self._a(v, 1003, ItemStatus.standard, "ISO 8601 file creation time.  This does not exist on some plaforms.  It can be later than modified time due to file copy.")
-    def info_tiff_bits(self, v=None):          return self._a(v, 1004, ItemStatus.standard, "Either 32 or 64.")
-    def info_tiff_order(self, v=None):         return self._a(v, 1005, ItemStatus.standard, "Either LE or BE.")
-    def info_ifd_first_offset(self, v=None):   return self._a(v, 1006, ItemStatus.standard, "Byte offset of the first IFD.")
-    def info_ifd_last_offset(self, v=None):    return self._a(v, 1007, ItemStatus.standard, "Byte offset of the last IFD.")
+    def info_file_size(self, v=None):          return self._a(v, 1001, ItemStatus.standard, comment="Bytes.")
+    def info_file_modified(self, v=None):      return self._a(v, 1002, ItemStatus.standard, comment="ISO 8601 file modified time according to platform.")
+    def info_tiff_version_bits(self, v=None):  return self._a(v, 1004, ItemStatus.standard, comment="Either 32 or 64.")
+    def info_tiff_version_order(self, v=None): return self._a(v, 1005, ItemStatus.standard, comment="Either LE or BE.")
+    def info_ifd_first_offset(self, v=None):   return self._a(v, 1006, ItemStatus.standard, comment="Byte offset of the first IFD.")
+    def info_ifd_last_offset(self, v=None):    return self._a(v, 1007, ItemStatus.standard, comment="Byte offset of the last IFD.")
     def info_ifd_count(self, v=None):          return self._a(v, 1008, ItemStatus.standard)
     def info_ifd_fragmentation(self, v=None):  return self._a(v, 1009, ItemStatus.standard)
-    def info_unaligned_offset_count(self, v=None):    return self._a(v, 1010, ItemStatus.standard, "TIFF6 requires 16bit alignment.  Almost no one cares.")
+    def info_unaligned_offset_count(self, v=None):    return self._a(v, 1010, ItemStatus.standard, ItemAuthority.tiff6, comment="TIFF6 mentions in passing several alignment rules, however since they are not well defined and not important on most hardware, it is safe to ignore them.")
 
     #####################
     #  End definitions  #
     #####################
 
-    def _a(self, val, code, status, comment=''):
+    def _a(self, val, code, status, authority=ItemAuthority.none, template='{}', comment=''):
         parts = inspect.stack()[1].function.split('_')
         name = ' '.join(parts[1:])
         if val != None:
-            i = Item(code, ItemCategory[parts[0]], status, name, comment, str(val))
+            val = [str(val)] if not isinstance(val, list) else [str(v) for v in val]
+            i = Item(code, ItemCategory[parts[0]], status, name, authority, template, comment, val)
             return self.items.append(i) or i
         else:
             for i in self.items:
@@ -273,7 +283,7 @@ class TifCheck:
             self.info_file_path_resolved(os.path.realpath(path))
             self.info_file_size(self.fsize)
             self.info_file_modified(datetime.fromtimestamp(finfo.st_mtime, UTC).strftime(ISO_8601_UTC))
-            self.info_file_created(datetime.fromtimestamp(_creation_time(finfo), UTC).strftime(ISO_8601_UTC))
+            # Note: info_file_created removed because of exceptions from unpredictable combinations of st_ctime/st_birthtime, python versions, and platforms.
         except:
             pass  # OS problems.
 
@@ -281,7 +291,7 @@ class TifCheck:
         b = f.read(TifPreamble.struct64.size)
         if len(b) < TifPreamble.struct64.size:
             # For simplicity we also trap here for file size between 32 and 64-bit preamble size, which is not recoverable.
-            self.fail_signature_missing(f'File size of {len(b)} is too small.')
+            self.fail_signature_missing(len(b))
             return False
 
         self.tp = TifPreamble(b)
@@ -293,8 +303,8 @@ class TifCheck:
             self.fail_tiff_version_unknown('0x' + self.tp.ver.hex())
             return False
 
-        self.info_tiff_bits(self.tp.bits)
-        self.info_tiff_order('LE' if self.tp.order == '<' else 'BE')
+        self.info_tiff_version_bits(self.tp.bits)
+        self.info_tiff_version_order('LE' if self.tp.order == '<' else 'BE')
         self.info_ifd_first_offset(self.zfill(self.tp.link))
         return True
 
@@ -358,8 +368,7 @@ class TifCheck:
         if ifd_size_total <= ifd_range():
             self.info_ifd_fragmentation(f'{1 - (ifd_size_total / ifd_range()):.2f}')
 
-        if unaligned:
-            self.info_unaligned_offset_count(unaligned)
+        self.info_unaligned_offset_count(unaligned)
         return True
 
     def _check_tags(self, f):
@@ -403,15 +412,17 @@ def _friendly_file_size(n):
     suffix = 'byte' if n == 1 else ['bytes', 'KB', 'MB', 'GB', 'TB'][unit]
     return f'{int(n / 1000 ** unit)} {suffix}'
 
-def _creation_time(os_stat):
-    # http://stackoverflow.com/a/39501288/1709587
-    if platform.system() == 'Windows':
-        return os_stat.st_ctime
-    else:
-        try:
-            return os_stat.st_birthtime
-        except AttributeError:
-            return os_stat.st_mtime  # It does not exist on some platforms.
+def _merge_report_json(a, b):
+    """Stitch the output of two json.dumps() calls with any indent, using two space indent."""
+    def strip_obj(x):
+        i = x.find('{') + 1
+        while x[i].isspace() or x[i] == ',':
+            i += 1
+        j = x.rfind('}')
+        while x[j - 1].isspace() or x[j - 1] == ',':
+            j -= 1
+        return x[i:j]
+    return f'{{\n  {strip_obj(a)},\n  {strip_obj(b)}\n}}'
 
 def _read_pos(f, pos, size):
     f.seek(pos)
@@ -456,8 +467,7 @@ def try_fix_tag_out_of_order(check, f, pos, ifd_index, entry_count, entries):
     return [tag for _, tag in reorder]
 
 def try_fix_tag_conflict(check, f, pos, ifd_index, entry_count, entries, tag, count):
-    msg = f'IFD #{ifd_index} at {check.zfill(pos)}: Tag {tag} has {count} copies in conflict.'
-    item = check.error_tag_conflict(msg)
+    item = check.error_tag_conflict([ifd_index, check.zfill(pos), tag, count])
 
     if item.code not in check.repairs.enabled:
         return entries, entry_count
@@ -538,60 +548,41 @@ def main(argv=None):
 
         # Output results.
         maxcat = max((i.category for i in result.items))
-        bits = result.info_tiff_bits()
-        order = result.info_tiff_order()
-        
-        _, info, note, warn, error, fail = \
-            [[i.valdict() for i in result.items if i.category == cat] for cat in ItemCategory]
-
-        temp = {
+        bits = result.info_tiff_version_bits()
+        order = result.info_tiff_version_order()
+        reportdict = {
             'application': {
                 'version': __version__,
                 'parameters': argv,
                 'time': datetime.now(UTC).strftime(ISO_8601_UTC),
+                'elapsed': f'{t:.2f}s',
             },
             'summary': {
-                'type': f'{order.value} {bits.value}-bit TIFF' if bits and order else 'Not a TIFF',
+                'type': f'{order.display()} {bits.display()}-bit TIFF' if bits and order else 'Not a TIFF',
                 'size': _friendly_file_size(os.path.getsize(path)),
                 'conformance': maxcat.name if maxcat > ItemCategory.info else 'ok',
+                'items': len(result.items),
                 'repairs': len(repairs.repaired),
             }
         }
-        report = json.dumps(temp, indent=2)[:-2]  # Strip '\n}'.
-        temp = {
-            'item counts': {
-                'fail': len(fail),
-                'error': len(error),
-                'warn': len(warn),
-                'note': len(note),
-                'info': len(info),
-            }
-        }
-        report += ',\n  ' + json.dumps(temp, indent=None)[1:-1]  # Strip outermost braces.
-        temp = {
-            'item sets': {
-                'fail': list({i['code'] for i in fail}),
-                'error': list({i['code'] for i in error}),
-                'warn': list({i['code'] for i in warn}),
-                'note': list({i['code'] for i in note}),
-                'info': list({i['code'] for i in info}),
-            }
-        }
-        report += ',\n  ' + json.dumps(temp, indent=None)[1:-1]  # Strip outermost braces.
-        temp = {
-            'items': {
-                'fail': fail,
-                'error': error,
-                'warn': warn,
-                'note': note,
-                'info': info,
-            }
-        }
+        report = json.dumps(reportdict, indent=2)
+        
+        categories = sorted(ItemCategory, key=lambda i: -i.value)
+        itemdict = {cat.name: [i.valdict() for i in result.items if i.category == cat]
+                    for cat in categories if any((i.category == cat for i in result.items))}
+
+        reportdict = {'item counts': {k: len(v) for k, v in itemdict.items()}}
+        report = _merge_report_json(report, json.dumps(reportdict, indent=None))
+
+        reportdict = {'item sets': {k: list({i['code'] for i in v}) for k, v in itemdict.items()}}
+        report = _merge_report_json(report, json.dumps(reportdict, indent=None))
+
+        reportdict = {'items': itemdict}
         if repairs.repaired:
-            temp['repaired'] = [i.valdict() for i in repairs.repaired]
-        report += ',' + json.dumps(temp, indent=2)[1:]  # Strip '{' but leave the '\n'.
+            reportdict['repaired'] = [i.valdict() for i in repairs.repaired]
+        report = _merge_report_json(report, json.dumps(reportdict, indent=2))
+
         print(report)
-        print(f'{t:.2f}s')
         return 0
 
     except Exception:
