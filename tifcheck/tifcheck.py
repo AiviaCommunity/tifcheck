@@ -23,7 +23,7 @@
 """
 Validate and repair TIFF files.
 
-This standalone Python 3.9 script produces a JSON formatted report listing
+This standalone Python 3.12 script produces a JSON formatted report listing
 items that describe conformance to TIFF Version 6, BigTIFF, and related
 formats, categorized by severity.
 
@@ -55,7 +55,7 @@ License: MIT
 ISO_8601_UTC = '%Y-%m-%dT%H:%M:%SZ'
 TAG_CUTOFF = 50
 
-__version__ = '20240716'
+__version__ = '20240930'
 
 import dataclasses
 import enum
@@ -69,7 +69,7 @@ import sys
 import tkinter
 import tkinter.filedialog
 import traceback
-from datetime import datetime
+from datetime import datetime, UTC
 from time import time
 
 ############################################################################
@@ -327,8 +327,8 @@ def check(path, repairs):
         try:
             r.info_file_path_resolved(os.path.realpath(path))
             r.info_file_size(fsize)
-            r.info_file_modified(datetime.utcfromtimestamp(finfo.st_mtime).strftime(ISO_8601_UTC))
-            r.info_file_created(datetime.utcfromtimestamp(_creation_time(finfo)).strftime(ISO_8601_UTC))
+            r.info_file_modified(datetime.fromtimestamp(finfo.st_mtime, UTC).strftime(ISO_8601_UTC))
+            r.info_file_created(datetime.fromtimestamp(_creation_time(finfo), UTC).strftime(ISO_8601_UTC))
         except:
             pass  # OS problems.
 
@@ -534,7 +534,7 @@ def main(argv=None):
             'application': {
                 'version': __version__,
                 'parameters': argv,
-                'time': datetime.utcnow().strftime(ISO_8601_UTC),
+                'time': datetime.now(UTC).strftime(ISO_8601_UTC),
             },
             'summary': {
                 'type': f'{order.value} {bits.value}-bit TIFF' if bits and order else 'Not a TIFF',
